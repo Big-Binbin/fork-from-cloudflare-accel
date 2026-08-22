@@ -1,12 +1,12 @@
-// 更新日期: 2026-06-28
+// 更新日期: 2026-08-22
 // 更新内容:
-// 1. 无论是否重定向，只要目标是 AWS S3，就自动补全 x-amz-content-sha256 和 x-amz-date
-// 2. 改进Docker镜像路径处理逻辑，支持多种格式: 如 hello-world | library/hello-world | docker.io/library/hello-world
-// 3. 解决大陆拉取第三方 Docker 镜像层失败的问题，自动递归处理所有 302/307 跳转，无论跳转到哪个域名，都由 Worker 继续反代，避免客户端直接访问被墙 CDN，从而提升拉取成功率
-// 4. 感谢老王，处理了暗黑模式下，输入框的颜色显示问题
-// 5. 支持 Git smart-http 协议代理，解决 git clone 时 GitHub 返回 dumb-http 403 错误
-// 6. 支持 GitLab 系列域名（gitlab.com 等）的 git clone 加速
-// 7. 首页新增 Git Clone 加速功能模块，方便生成加速命令
+// 1. Docker 镜像层重定向改为循环跟随（最多 5 次），支持 CDN 多级跳转，提升拉取成功率
+// 2. 新增 OPTIONS 预检请求处理，修复 CORS 预检被当作代理请求的问题
+// 3. 首页移除 cdn.tailwindcss.com 依赖，改为内联 CSS，国内访问不再被外链阻塞
+// 4. 前端支持 http:// 开头的链接输入，与后端能力对齐
+// 5. 首页增加 Cache-Control 缓存头，命中边缘缓存
+// 6. RESTRICT_PATHS 路径检查改用提取后的目标路径（原先误用含域名前缀的原始路径）
+// 7. 移除所有日志输出与死代码，公共常量提升到模块顶层，减少每请求开销
 // 用户配置区域开始 =================================
 // 以下变量用于配置代理服务的白名单和安全设置，可根据需求修改。
 
@@ -55,13 +55,42 @@ const ALLOWED_PATHS = [
 
 // 用户配置区域结束 =================================
 
+// Docker 镜像仓库域名列表（模块级常量，避免每个请求重复创建）
+const DOCKER_REGISTRY_HOSTS = [
+  'quay.io',
+  'gcr.io',
+  'k8s.gcr.io',
+  'registry.k8s.io',
+  'ghcr.io',
+  'docker.cloudsmith.io',
+  'registry-1.docker.io'
+];
+
+// Git 托管平台域名列表（模块级常量，避免每个请求重复创建）
+const GIT_HOSTS = [
+  'github.com',
+  'api.github.com',
+  'raw.githubusercontent.com',
+  'gist.github.com',
+  'gist.githubusercontent.com',
+  'gitlab.com',
+  'gitlab.freedesktop.org',
+  'gitlab.gnome.org',
+  'gitlab.kitware.com',
+  'gitlab.archlinux.org',
+  'gitlab.postmarketos.org'
+];
+
+// Docker 镜像层重定向最大跟随次数（CDN 多级跳转保护）
+const MAX_REDIRECTS = 5;
+
 // 闪电 SVG 图标（Base64 编码）
 const LIGHTNING_SVG = `
 <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#FBBF24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
   <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"></path>
 </svg>`;
 
-// 首页 HTML
+// 首页 HTML（样式全部内联，不依赖任何外部 CDN）
 const HOMEPAGE_HTML = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -70,16 +99,17 @@ const HOMEPAGE_HTML = `
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Cloudflare 加速</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,${encodeURIComponent(LIGHTNING_SVG)}">
-  <script src="https://cdn.tailwindcss.com"></script>
   <style>
+    * { box-sizing: border-box; }
     body {
       min-height: 100vh;
       display: flex;
       align-items: center;
       justify-content: center;
-      font-family: 'Inter', sans-serif;
+      font-family: 'Inter', 'PingFang SC', 'Microsoft YaHei', sans-serif;
       transition: background-color 0.3s, color 0.3s;
       padding: 1rem;
+      margin: 0;
     }
     .light-mode {
       background: linear-gradient(to bottom right, #f1f5f9, #e2e8f0);
@@ -92,6 +122,7 @@ const HOMEPAGE_HTML = `
     .container {
       width: 100%;
       max-width: 800px;
+      margin: 0 auto;
       padding: 1.5rem;
       border-radius: 0.75rem;
       border: 1px solid #e5e7eb;
@@ -102,6 +133,7 @@ const HOMEPAGE_HTML = `
     }
     .dark-mode .container {
       background: #1f2937;
+      border-color: #374151;
     }
     .section-box {
       background: linear-gradient(to bottom, #ffffff, #f3f4f6);
@@ -114,12 +146,46 @@ const HOMEPAGE_HTML = `
       background: linear-gradient(to bottom, #374151, #1f2937);
       box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
     }
+    h1 {
+      font-size: 1.875rem;
+      font-weight: 700;
+      text-align: center;
+      margin: 0 0 2rem 0;
+    }
+    h2 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin: 0 0 0.5rem 0;
+    }
+    p {
+      color: #4b5563;
+      margin: 0 0 1rem 0;
+    }
+    .dark-mode p {
+      color: #d1d5db;
+    }
     .theme-toggle {
       position: fixed;
       top: 0.5rem;
       right: 0.5rem;
       padding: 0.5rem;
       font-size: 1.2rem;
+      border: none;
+      cursor: pointer;
+      background: #e5e7eb;
+      color: #1f2937;
+      border-radius: 9999px;
+      transition: background-color 0.2s;
+    }
+    .theme-toggle:hover {
+      background: #d1d5db;
+    }
+    .dark-mode .theme-toggle {
+      background: #374151;
+      color: #e5e7eb;
+    }
+    .dark-mode .theme-toggle:hover {
+      background: #4b5563;
     }
     .toast {
       position: fixed;
@@ -148,18 +214,98 @@ const HOMEPAGE_HTML = `
       padding: 0.5rem;
       border-radius: 0.25rem;
       background: #f3f4f6;
+      color: #059669;
+      margin: 0.5rem 0 0 0;
     }
     .dark-mode .result-text {
       background: #2d3748;
+      color: #34d399;
     }
-
+    .input-row {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 0.5rem;
+    }
     input[type="text"] {
-      background-color: white !important;
-      color: #111827 !important;
+      flex-grow: 1;
+      padding: 0.5rem;
+      border: 1px solid #9ca3af;
+      border-radius: 0.5rem;
+      outline: none;
+      background: #ffffff;
+      color: #111827;
+      font-size: 1rem;
+    }
+    input[type="text"]::placeholder {
+      color: #9ca3af;
+    }
+    input[type="text"]:focus {
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.5);
     }
     .dark-mode input[type="text"] {
-      background-color: #374151 !important;
-      color: #e5e7eb !important;
+      background: #374151;
+      color: #e5e7eb;
+      border-color: #4b5563;
+    }
+    .dark-mode input[type="text"]::placeholder {
+      color: #6b7280;
+    }
+    .btn {
+      border: none;
+      cursor: pointer;
+      border-radius: 0.5rem;
+      transition: background-color 0.2s;
+      font-size: 1rem;
+    }
+    .btn-primary {
+      background: #3b82f6;
+      color: #ffffff;
+      padding: 0.5rem 1rem;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .btn-primary:hover {
+      background: #2563eb;
+    }
+    .btn-secondary {
+      background: #e5e7eb;
+      color: #1f2937;
+      padding: 0.25rem 0.75rem;
+      width: 100%;
+    }
+    .btn-secondary:hover {
+      background: #d1d5db;
+    }
+    .dark-mode .btn-secondary {
+      background: #4b5563;
+      color: #e5e7eb;
+    }
+    .dark-mode .btn-secondary:hover {
+      background: #6b7280;
+    }
+    .btn-row {
+      display: flex;
+      gap: 0.5rem;
+      margin-top: 0.5rem;
+    }
+    .hidden {
+      display: none;
+    }
+    footer {
+      margin-top: 1.5rem;
+      text-align: center;
+      color: #6b7280;
+    }
+    .dark-mode footer {
+      color: #9ca3af;
+    }
+    footer a {
+      color: #3b82f6;
+      text-decoration: none;
+    }
+    footer a:hover {
+      text-decoration: underline;
     }
 
     @media (max-width: 640px) {
@@ -191,11 +337,11 @@ const HOMEPAGE_HTML = `
         padding: 0.5rem 1rem;
         min-height: 44px;
       }
-      .flex.gap-2 {
+      .input-row {
         flex-direction: column;
         gap: 0.5rem;
       }
-      .github-buttons, .docker-buttons {
+      .btn-row {
         flex-direction: column;
         gap: 0.5rem;
       }
@@ -210,65 +356,63 @@ const HOMEPAGE_HTML = `
   </style>
 </head>
 <body class="light-mode">
-  <button onclick="toggleTheme()" class="theme-toggle bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200 rounded-full hover:bg-gray-300 dark:hover:bg-gray-600 transition">
+  <button onclick="toggleTheme()" class="theme-toggle">
     <span class="sun">☀️</span>
     <span class="moon hidden">🌙</span>
   </button>
-  <div class="container mx-auto">
-    <h1 class="text-3xl font-bold text-center mb-8">Cloudflare 加速下载</h1>
+  <div class="container">
+    <h1>Cloudflare 加速下载</h1>
 
     <!-- GitHub 链接转换 -->
     <div class="section-box">
-      <h2 class="text-xl font-semibold mb-2">⚡ GitHub 文件加速 / Git Clone</h2>
-      <p class="text-gray-600 dark:text-gray-300 mb-4">输入 GitHub 文件链接获取加速链接；输入以 .git 结尾的仓库地址则自动生成 git clone 加速命令。</p>
-      <div class="flex gap-2 mb-2">
+      <h2>⚡ GitHub 文件加速 / Git Clone</h2>
+      <p>输入 GitHub 文件链接获取加速链接；输入以 .git 结尾的仓库地址则自动生成 git clone 加速命令。</p>
+      <div class="input-row">
         <input
           id="github-url"
           type="text"
           placeholder="请输入 GitHub 文件链接或 .git 仓库地址，例如：https://github.com/user/repo/releases/..."
-          class="flex-grow p-2 border border-gray-400 dark:border-gray-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500"
         >
         <button
           id="github-submit-btn"
           onclick="convertGithubUrl()"
-          class="bg-blue-500 text-white px-4 py-2 rounded-lg hover:bg-blue-600 transition"
+          class="btn btn-primary"
         >
           获取加速链接
         </button>
       </div>
-      <p id="github-result" class="mt-2 text-green-600 dark:text-green-400 result-text hidden"></p>
-      <div id="github-buttons" class="flex gap-2 mt-2 github-buttons hidden">
-        <button onclick="copyGithubUrl()" class="bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-gray-200 px-3 py-1 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-500 transition w-full">📋 复制</button>
-        <button onclick="openGithubUrl()" class="bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-gray-200 px-3 py-1 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-500 transition w-full">🔗 打开链接</button>
+      <p id="github-result" class="result-text hidden"></p>
+      <div id="github-buttons" class="btn-row hidden">
+        <button onclick="copyGithubUrl()" class="btn btn-secondary">📋 复制</button>
+        <button onclick="openGithubUrl()" class="btn btn-secondary">🔗 打开链接</button>
       </div>
     </div>
 
     <!-- Docker 镜像加速 -->
     <div class="section-box">
-      <h2 class="text-xl font-semibold mb-2">🐳 Docker 镜像加速</h2>
-      <p class="text-gray-600 dark:text-gray-300 mb-4">输入原镜像地址（如 hello-world 或 ghcr.io/user/repo），获取加速拉取命令。</p>
-      <div class="flex gap-2 mb-2">
+      <h2>🐳 Docker 镜像加速</h2>
+      <p>输入原镜像地址（如 hello-world 或 ghcr.io/user/repo），获取加速拉取命令。</p>
+      <div class="input-row">
         <input
           id="docker-image"
           type="text"
           placeholder="请输入镜像地址，例如：hello-world 或 ghcr.io/user/repo"
-          class="flex-grow p-2 border border-gray-400 dark:border-gray-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500"
         >
         <button
           onclick="convertDockerImage()"
-          class="bg-blue-500 text-white px-4 py-2 rounded-lg hover:bg-blue-600 transition"
+          class="btn btn-primary"
         >
           获取加速命令
         </button>
       </div>
-      <p id="docker-result" class="mt-2 text-green-600 dark:text-green-400 result-text hidden"></p>
-      <div id="docker-buttons" class="flex gap-2 mt-2 docker-buttons hidden">
-        <button onclick="copyDockerCommand()" class="bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-gray-200 px-3 py-1 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-500 transition w-full">📋 复制命令</button>
+      <p id="docker-result" class="result-text hidden"></p>
+      <div id="docker-buttons" class="btn-row hidden">
+        <button onclick="copyDockerCommand()" class="btn btn-secondary">📋 复制命令</button>
       </div>
     </div>
 
-    <footer class="mt-6 text-center text-gray-500 dark:text-gray-400">
-      Powered by <a href="https://github.com/fscarmen2/Cloudflare-Accel" class="text-blue-500 hover:underline">fscarmen2/Cloudflare-Accel</a>
+    <footer>
+      Powered by <a href="https://github.com/fscarmen2/Cloudflare-Accel">fscarmen2/Cloudflare-Accel</a>
     </footer>
   </div>
 
@@ -307,8 +451,8 @@ const HOMEPAGE_HTML = `
     function showToast(message, isError = false) {
       const toast = document.getElementById('toast');
       toast.textContent = message;
-      toast.classList.remove(isError ? 'bg-green-500' : 'bg-red-500');
-      toast.classList.add(isError ? 'bg-red-500' : 'bg-green-500');
+      // 错误提示红色，成功提示绿色
+      toast.style.background = isError ? '#ef4444' : '#10b981';
       toast.classList.add('show');
       setTimeout(() => {
         toast.classList.remove('show');
@@ -358,20 +502,21 @@ const HOMEPAGE_HTML = `
         buttons.classList.add('hidden');
         return;
       }
-      if (!input.startsWith('https://')) {
-        showToast('链接必须以 https:// 开头', true);
+      // 同时支持 https:// 和 http:// 开头的链接
+      const schemeMatch = input.match(/^(https?):\\/\\//);
+      if (!schemeMatch) {
+        showToast('链接必须以 http:// 或 https:// 开头', true);
         result.classList.add('hidden');
         buttons.classList.add('hidden');
         return;
       }
+      const rest = input.substring(schemeMatch[0].length);
 
       // 检测是否以 .git 结尾，如果是则输出 git clone 指令
       if (input.endsWith('.git')) {
         githubIsGitMode = true;
         submitBtn.textContent = '获取加速命令';
-        const domainPath = input.substring(8); // 去掉 https://
-        const proxyUrl = 'https://' + currentDomain + '/https://' + domainPath;
-        githubAcceleratedUrl = 'git clone ' + proxyUrl;
+        githubAcceleratedUrl = 'git clone https://' + currentDomain + '/' + schemeMatch[0] + rest;
         result.textContent = '加速命令: ' + githubAcceleratedUrl;
         result.classList.remove('hidden');
         buttons.classList.remove('hidden');
@@ -389,7 +534,7 @@ const HOMEPAGE_HTML = `
       githubIsGitMode = false;
       submitBtn.textContent = '获取加速链接';
       // 保持现有格式：域名/https://原始链接
-      githubAcceleratedUrl = 'https://' + currentDomain + '/https://' + input.substring(8);
+      githubAcceleratedUrl = 'https://' + currentDomain + '/' + schemeMatch[0] + rest;
       result.textContent = '加速链接: ' + githubAcceleratedUrl;
       result.classList.remove('hidden');
       buttons.classList.remove('hidden');
@@ -452,32 +597,26 @@ const HOMEPAGE_HTML = `
 </html>
 `;
 
+// 获取 Docker registry 的匿名 token
+// 参数：realm 认证地址 / service 服务名 / scope 资源范围；返回 token 字符串或 null
 async function handleToken(realm, service, scope) {
-  const tokenUrl = `${realm}?service=${service}&scope=${scope}`;
-  console.log(`Fetching token from: ${tokenUrl}`);
+  const tokenUrl = realm + '?service=' + service + '&scope=' + scope;
   try {
     const tokenResponse = await fetch(tokenUrl, {
       method: 'GET',
       headers: { 'Accept': 'application/json' }
     });
     if (!tokenResponse.ok) {
-      console.log(`Token request failed: ${tokenResponse.status} ${tokenResponse.statusText}`);
       return null;
     }
     const tokenData = await tokenResponse.json();
-    const token = tokenData.token || tokenData.access_token;
-    if (!token) {
-      console.log('No token found in response');
-      return null;
-    }
-    console.log('Token acquired successfully');
-    return token;
+    return tokenData.token || tokenData.access_token || null;
   } catch (error) {
-    console.log(`Error fetching token: ${error.message}`);
     return null;
   }
 }
 
+// 判断 URL 是否指向 AWS S3（用于补全 x-amz 签名头）
 function isAmazonS3(url) {
   try {
     return new URL(url).hostname.includes('amazonaws.com');
@@ -486,16 +625,12 @@ function isAmazonS3(url) {
   }
 }
 
-// 计算请求体的 SHA256 哈希值
-async function calculateSHA256(message) {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(message);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+// 生成 AWS S3 要求的 x-amz-date 时间戳（格式：YYYYMMDDTHHMMSSZ）
+function getAmzDate() {
+  return new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z';
 }
 
-// 获取空请求体的 SHA256 哈希值
+// 获取空请求体的 SHA256 哈希值（S3 匿名请求固定值）
 function getEmptyBodySHA256() {
   return 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 }
@@ -508,9 +643,7 @@ function isGitRequest(request, targetDomain) {
     return true;
   }
   // 检查目标域名是否为 Git 托管平台
-  const gitDomains = ['github.com', 'api.github.com', 'raw.githubusercontent.com', 'gist.github.com', 'gist.githubusercontent.com', 'gitlab.com', 'gitlab.freedesktop.org', 'gitlab.gnome.org', 'gitlab.kitware.com', 'gitlab.archlinux.org', 'gitlab.postmarketos.org'];
-  if (gitDomains.includes(targetDomain)) {
-    // 检查路径是否包含 Git 协议特征
+  if (GIT_HOSTS.includes(targetDomain)) {
     const url = new URL(request.url);
     const path = url.pathname;
     // Git smart-http 使用 /info/refs?service=git-upload-pack 或 /git-upload-pack
@@ -532,7 +665,8 @@ function buildGitHeaders(request, targetDomain) {
   // 设置正确的 Host
   headers.set('Host', targetDomain);
 
-  // 删除可能干扰 Git 协议的 Cloudflare 特定头部
+  // 删除可能干扰 Git 协议的头部
+  headers.delete('Cookie');
   headers.delete('CF-Connecting-IP');
   headers.delete('CF-IPCountry');
   headers.delete('CF-Ray');
@@ -552,26 +686,38 @@ function buildGitHeaders(request, targetDomain) {
   return headers;
 }
 
-async function handleRequest(request, redirectCount = 0) {
-  const MAX_REDIRECTS = 5; // 最大重定向次数
+async function handleRequest(request) {
   const url = new URL(request.url);
   let path = url.pathname;
 
-  // 记录请求信息
-  console.log(`Request: ${request.method} ${path}`);
-
-  // 首页路由
+  // 首页路由（带缓存头，命中边缘缓存）
   if (path === '/' || path === '') {
     return new Response(HOMEPAGE_HTML, {
       status: 200,
-      headers: { 'Content-Type': 'text/html' }
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'public, max-age=3600'
+      }
+    });
+  }
+
+  // CORS 预检请求直接放行，不进入代理逻辑
+  if (request.method === 'OPTIONS') {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
+        'Access-Control-Allow-Headers': '*',
+        'Access-Control-Max-Age': '86400'
+      }
     });
   }
 
   // 处理 Docker V2 API 或 GitHub 代理请求
   let isV2Request = false;
-  let v2RequestType = null; // 'manifests' or 'blobs'
-  let v2RequestTag = null;  // tag or digest
+  let v2RequestType = null; // 'manifests' 或 'blobs'
+  let v2RequestTag = null;  // tag 或 digest
   if (path.startsWith('/v2/')) {
     isV2Request = true;
     path = path.replace('/v2/', '');
@@ -603,17 +749,15 @@ async function handleRequest(request, redirectCount = 0) {
     // 处理 /https://domain.com/... 或 /http://domain.com/... 格式
     const urlObj = new URL(fullPath);
     targetDomain = urlObj.hostname;
-    targetPath = urlObj.pathname.substring(1) + urlObj.search; // 移除开头的斜杠
+    targetPath = urlObj.pathname.substring(1) + url.search; // 移除开头的斜杠
 
     // 检查是否为 Docker 请求
-    isDockerRequest = ['quay.io', 'gcr.io', 'k8s.gcr.io', 'registry.k8s.io', 'ghcr.io', 'docker.cloudsmith.io', 'registry-1.docker.io', 'docker.io'].includes(targetDomain);
+    isDockerRequest = DOCKER_REGISTRY_HOSTS.includes(targetDomain) || targetDomain === 'docker.io';
 
     // 处理 docker.io 域名，转换为 registry-1.docker.io
     if (targetDomain === 'docker.io') {
       targetDomain = 'registry-1.docker.io';
     }
-
-
   } else {
     // 处理 Docker 镜像路径的多种格式
     if (pathParts[0] === 'docker.io') {
@@ -623,7 +767,7 @@ async function handleRequest(request, redirectCount = 0) {
 
       if (pathParts.length === 2) {
         // 处理 docker.io/nginx 格式，添加 library 命名空间
-        targetPath = `library/${pathParts[1]}`;
+        targetPath = 'library/' + pathParts[1];
       } else {
         // 处理 docker.io/amilys/embyserver 或 docker.io/library/nginx 格式
         targetPath = pathParts.slice(1).join('/');
@@ -632,7 +776,7 @@ async function handleRequest(request, redirectCount = 0) {
       // Docker 镜像仓库（如 ghcr.io）或 GitHub 域名（如 github.com）
       targetDomain = pathParts[0];
       targetPath = pathParts.slice(1).join('/') + url.search;
-      isDockerRequest = ['quay.io', 'gcr.io', 'k8s.gcr.io', 'registry.k8s.io', 'ghcr.io', 'docker.cloudsmith.io', 'registry-1.docker.io'].includes(targetDomain);
+      isDockerRequest = DOCKER_REGISTRY_HOSTS.includes(targetDomain);
     } else if (pathParts.length >= 1 && pathParts[0] === 'library') {
       // 处理 library/nginx 格式
       isDockerRequest = true;
@@ -647,26 +791,22 @@ async function handleRequest(request, redirectCount = 0) {
       // 处理单个镜像名称，如 nginx
       isDockerRequest = true;
       targetDomain = 'registry-1.docker.io';
-      targetPath = `library/${pathParts.join('/')}`;
+      targetPath = 'library/' + pathParts.join('/');
     }
   }
 
   // 默认白名单检查：只允许 ALLOWED_HOSTS 中的域名
   if (!ALLOWED_HOSTS.includes(targetDomain)) {
-    console.log(`Blocked: Domain ${targetDomain} not in allowed list`);
-    return new Response(`Error: Invalid target domain.\n`, { status: 400 });
+    return new Response('Error: Invalid target domain.\n', { status: 400 });
   }
 
-  // 路径白名单检查（仅当 RESTRICT_PATHS = true 时）
+  // 路径白名单检查（仅当 RESTRICT_PATHS = true 时生效）
   if (RESTRICT_PATHS) {
-    const checkPath = isDockerRequest ? targetPath : path;
-    console.log(`Checking whitelist against path: ${checkPath}`);
     const isPathAllowed = ALLOWED_PATHS.some(pathString =>
-      checkPath.toLowerCase().includes(pathString.toLowerCase())
+      targetPath.toLowerCase().includes(pathString.toLowerCase())
     );
     if (!isPathAllowed) {
-      console.log(`Blocked: Path ${checkPath} not in allowed paths`);
-      return new Response(`Error: The path is not in the allowed paths.\n`, { status: 403 });
+      return new Response('Error: The path is not in the allowed paths.\n', { status: 403 });
     }
   }
 
@@ -675,12 +815,12 @@ async function handleRequest(request, redirectCount = 0) {
   if (isDockerRequest) {
     if (isV2Request && v2RequestType && v2RequestTag) {
       // 重构 V2 API URL
-      targetUrl = `https://${targetDomain}/v2/${targetPath}/${v2RequestType}/${v2RequestTag}`;
+      targetUrl = 'https://' + targetDomain + '/v2/' + targetPath + '/' + v2RequestType + '/' + v2RequestTag;
     } else {
-      targetUrl = `https://${targetDomain}/${isV2Request ? 'v2/' : ''}${targetPath}`;
+      targetUrl = 'https://' + targetDomain + '/' + (isV2Request ? 'v2/' : '') + targetPath;
     }
   } else {
-    targetUrl = `https://${targetDomain}/${targetPath}`;
+    targetUrl = 'https://' + targetDomain + '/' + targetPath;
   }
 
   // 检测是否为 Git smart-http 请求
@@ -693,6 +833,7 @@ async function handleRequest(request, redirectCount = 0) {
   } else {
     newRequestHeaders = new Headers(request.headers);
     newRequestHeaders.set('Host', targetDomain);
+    newRequestHeaders.delete('Cookie');
     newRequestHeaders.delete('x-amz-content-sha256');
     newRequestHeaders.delete('x-amz-date');
     newRequestHeaders.delete('x-amz-security-token');
@@ -700,7 +841,7 @@ async function handleRequest(request, redirectCount = 0) {
 
     if (isAmazonS3(targetUrl)) {
       newRequestHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
-      newRequestHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
+      newRequestHeaders.set('x-amz-date', getAmzDate());
     }
   }
 
@@ -715,111 +856,52 @@ async function handleRequest(request, redirectCount = 0) {
       body: request.body,
       redirect: redirectMode
     });
-    console.log(`Initial response: ${response.status} ${response.statusText} [git=${isGit}]`);
 
-    // 处理 Docker 认证挑战
+    // 处理 Docker 认证挑战（401 时自动获取匿名 token 重试）
     if (isDockerRequest && response.status === 401) {
       const wwwAuth = response.headers.get('WWW-Authenticate');
-      if (wwwAuth) {
-        const authMatch = wwwAuth.match(/Bearer realm="([^"]+)",service="([^"]*)",scope="([^"]*)"/);
-        if (authMatch) {
-          const [, realm, service, scope] = authMatch;
-          console.log(`Auth challenge: realm=${realm}, service=${service || targetDomain}, scope=${scope}`);
-
-          const token = await handleToken(realm, service || targetDomain, scope);
-          if (token) {
-            const authHeaders = new Headers(request.headers);
-            authHeaders.set('Authorization', `Bearer ${token}`);
-            authHeaders.set('Host', targetDomain);
-            // 如果目标是 S3，添加必要的 x-amz 头；否则删除可能干扰的头部
-            if (isAmazonS3(targetUrl)) {
-              authHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
-              authHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
-            } else {
-              authHeaders.delete('x-amz-content-sha256');
-              authHeaders.delete('x-amz-date');
-              authHeaders.delete('x-amz-security-token');
-              authHeaders.delete('x-amz-user-agent');
-            }
-
-            const authRequest = new Request(targetUrl, {
-              method: request.method,
-              headers: authHeaders,
-              body: request.body,
-              redirect: 'manual'
-            });
-            console.log('Retrying with token');
-            response = await fetch(authRequest);
-            console.log(`Token response: ${response.status} ${response.statusText}`);
-          } else {
-            console.log('No token acquired, falling back to anonymous request');
-            const anonHeaders = new Headers(request.headers);
-            anonHeaders.delete('Authorization');
-            anonHeaders.set('Host', targetDomain);
-            // 如果目标是 S3，添加必要的 x-amz 头；否则删除可能干扰的头部
-            if (isAmazonS3(targetUrl)) {
-              anonHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
-              anonHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
-            } else {
-              anonHeaders.delete('x-amz-content-sha256');
-              anonHeaders.delete('x-amz-date');
-              anonHeaders.delete('x-amz-security-token');
-              anonHeaders.delete('x-amz-user-agent');
-            }
-
-            const anonRequest = new Request(targetUrl, {
-              method: request.method,
-              headers: anonHeaders,
-              body: request.body,
-              redirect: 'manual'
-            });
-            response = await fetch(anonRequest);
-            console.log(`Anonymous response: ${response.status} ${response.statusText}`);
-          }
+      const authMatch = wwwAuth && wwwAuth.match(/Bearer realm="([^"]+)",service="([^"]*)",scope="([^"]*)"/);
+      if (authMatch) {
+        const [, realm, service, scope] = authMatch;
+        const token = await handleToken(realm, service || targetDomain, scope);
+        const authHeaders = new Headers(newRequestHeaders);
+        if (token) {
+          authHeaders.set('Authorization', 'Bearer ' + token);
         } else {
-          console.log('Invalid WWW-Authenticate header');
+          authHeaders.delete('Authorization');
         }
-      } else {
-        console.log('No WWW-Authenticate header in 401 response');
-      }
-    }
-
-    // 处理 S3 重定向（Docker 镜像层）
-    if (isDockerRequest && (response.status === 307 || response.status === 302)) {
-      const redirectUrl = response.headers.get('Location');
-      if (redirectUrl) {
-        console.log(`Redirect detected: ${redirectUrl}`);
-        const redirectHeaders = new Headers(request.headers);
-        redirectHeaders.set('Host', new URL(redirectUrl).hostname);
-
-        // 对于 S3 重定向，添加必要的 AWS 头
-        if (isAmazonS3(redirectUrl)) {
-          const EMPTY_BODY_SHA256 = getEmptyBodySHA256();
-          redirectHeaders.set('x-amz-content-sha256', EMPTY_BODY_SHA256);
-          redirectHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
-        }
-
-        if (response.headers.get('Authorization')) {
-          redirectHeaders.set('Authorization', response.headers.get('Authorization'));
-        }
-
-        const redirectRequest = new Request(redirectUrl, {
+        response = await fetch(targetUrl, {
           method: request.method,
-          headers: redirectHeaders,
+          headers: authHeaders,
           body: request.body,
           redirect: 'manual'
         });
-        response = await fetch(redirectRequest);
-        console.log(`Redirect response: ${response.status} ${response.statusText}`);
-
-        if (!response.ok) {
-          console.log('Redirect request failed, returning original redirect response');
-          return new Response(response.body, {
-            status: response.status,
-            headers: response.headers
-          });
-        }
       }
+    }
+
+    // 处理 Docker 重定向（镜像层可能多级 CDN 跳转，循环由 Worker 继续反代）
+    let redirects = 0;
+    while (isDockerRequest && (response.status === 302 || response.status === 307)) {
+      const redirectUrl = response.headers.get('Location');
+      if (!redirectUrl || redirects >= MAX_REDIRECTS) {
+        break;
+      }
+      redirects++;
+      const redirectHeaders = new Headers(newRequestHeaders);
+      redirectHeaders.set('Host', new URL(redirectUrl).hostname);
+
+      // 对于 S3 重定向，添加必要的 AWS 头
+      if (isAmazonS3(redirectUrl)) {
+        redirectHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
+        redirectHeaders.set('x-amz-date', getAmzDate());
+      }
+
+      response = await fetch(redirectUrl, {
+        method: request.method,
+        headers: redirectHeaders,
+        body: request.body,
+        redirect: 'manual'
+      });
     }
 
     // 复制响应并添加 CORS 头
@@ -829,28 +911,13 @@ async function handleRequest(request, redirectCount = 0) {
 
     if (isDockerRequest) {
       newResponse.headers.set('Docker-Distribution-API-Version', 'registry/2.0');
-      // 删除可能存在的重定向头，确保所有请求都通过Worker处理
+      // 删除可能存在的重定向头，确保所有请求都通过 Worker 处理
       newResponse.headers.delete('Location');
-    }
-
-    // Git smart-http 特殊处理：
-    // 1. 保留 Location 头（Git 需要处理重定向）
-    // 2. 保留原始 Content-Type（如 application/x-git-upload-pack-advertisement）
-    // 3. 保留 Transfer-Encoding（Git 需要 chunked 编码）
-    if (isGit) {
-      // Git 需要原始的响应头，不要删除 Location
-      // 确保 Content-Type 不被修改
-      const contentType = response.headers.get('Content-Type');
-      if (contentType && contentType.includes('x-git-')) {
-        // Git smart-http 响应，保持原样
-        console.log(`Git smart-http response: ${response.status} ${contentType}`);
-      }
     }
 
     return newResponse;
   } catch (error) {
-    console.log(`Fetch error: ${error.message}`);
-    return new Response(`Error fetching from ${targetDomain}: ${error.message}\n`, { status: 500 });
+    return new Response('Error fetching from ' + targetDomain + ': ' + error.message + '\n', { status: 500 });
   }
 }
 
