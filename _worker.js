@@ -23,11 +23,18 @@ const ALLOWED_HOSTS = [
   'ghcr.io',
   'docker.cloudsmith.io',
   'registry-1.docker.io',
+  'index.docker.io',
+  'production.cloudflare.docker.com',
   'github.com',
   'api.github.com',
+  'codeload.github.com',
   'raw.githubusercontent.com',
   'gist.github.com',
   'gist.githubusercontent.com',
+  'release-assets.githubusercontent.com',
+  'objects.githubusercontent.com',
+  'media.githubusercontent.com',
+  'avatars.githubusercontent.com',
   'gitlab.com',
   'gitlab.freedesktop.org',
   'gitlab.gnome.org',
@@ -63,13 +70,16 @@ const DOCKER_REGISTRY_HOSTS = [
   'registry.k8s.io',
   'ghcr.io',
   'docker.cloudsmith.io',
-  'registry-1.docker.io'
+  'registry-1.docker.io',
+  'index.docker.io',
+  'production.cloudflare.docker.com'
 ];
 
 // Git 托管平台域名列表（模块级常量，避免每个请求重复创建）
 const GIT_HOSTS = [
   'github.com',
   'api.github.com',
+  'codeload.github.com',
   'raw.githubusercontent.com',
   'gist.github.com',
   'gist.githubusercontent.com',
@@ -732,8 +742,8 @@ async function handleRequest(request) {
     // 检查是否为 Docker 请求
     isDockerRequest = DOCKER_REGISTRY_HOSTS.includes(targetDomain) || targetDomain === 'docker.io';
 
-    // 处理 docker.io 域名，转换为 registry-1.docker.io
-    if (targetDomain === 'docker.io') {
+    // 处理 docker.io 系域名，转换为 registry-1.docker.io（新版 V2 API 端点）
+    if (targetDomain === 'docker.io' || targetDomain === 'index.docker.io') {
       targetDomain = 'registry-1.docker.io';
     }
   } else {
