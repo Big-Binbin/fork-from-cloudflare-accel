@@ -292,21 +292,6 @@ const HOMEPAGE_HTML = `
     .hidden {
       display: none;
     }
-    footer {
-      margin-top: 1.5rem;
-      text-align: center;
-      color: #6b7280;
-    }
-    .dark-mode footer {
-      color: #9ca3af;
-    }
-    footer a {
-      color: #3b82f6;
-      text-decoration: none;
-    }
-    footer a:hover {
-      text-decoration: underline;
-    }
 
     @media (max-width: 640px) {
       .container {
@@ -348,9 +333,6 @@ const HOMEPAGE_HTML = `
       .result-text {
         font-size: 0.8rem;
         padding: 0.4rem;
-      }
-      footer {
-        font-size: 0.75rem;
       }
     }
   </style>
@@ -410,10 +392,6 @@ const HOMEPAGE_HTML = `
         <button onclick="copyDockerCommand()" class="btn btn-secondary">📋 复制命令</button>
       </div>
     </div>
-
-    <footer>
-      Powered by <a href="https://github.com/fscarmen2/Cloudflare-Accel">fscarmen2/Cloudflare-Accel</a>
-    </footer>
   </div>
 
   <div id="toast" class="toast"></div>
