@@ -1,5 +1,11 @@
-// 更新日期: 2026-08-22
+// 更新日期: 2026-09-05
 // 更新内容:
+// 1. 回源请求增加超时与重试（fetchWithRetry）：单次回源最多等 10s，GET/HEAD 失败自动重试，
+//    解决 EdgeOne 大陆节点回源 GitHub 偶发跨境抖动导致的间歇性 504
+// 2. 新增边缘缓存：GET 的 200 响应写入 caches.default，TTL 跟随上游 Cache-Control，
+//    热点文件命中缓存直接返回，不再回源
+// 3. 回源超时显式返回 504（AbortError），与普通错误 500 区分，便于排查
+// 历史更新（2026-08-22）:
 // 1. Docker 镜像层重定向改为循环跟随（最多 5 次），支持 CDN 多级跳转，提升拉取成功率
 // 2. 新增 OPTIONS 预检请求处理，修复 CORS 预检被当作代理请求的问题
 // 3. 首页移除 cdn.tailwindcss.com 依赖，改为内联 CSS，国内访问不再被外链阻塞
@@ -681,6 +687,40 @@ function buildGitHeaders(request, targetDomain) {
   return headers;
 }
 
+// 带超时与重试的回源请求
+// 背景：EdgeOne 大陆节点回源 GitHub 偶发跨境抖动，单次裸 fetch 变慢会被边缘函数
+// 约 15s 的执行时限掐断，用户侧表现为间歇性 504。
+// - 每次尝试最多等 10s，超时即放弃本次尝试，为重试留出时间；
+// - 仅对 GET/HEAD（无请求体、幂等）自动重试；POST 等带流式请求体的方法重试会导致
+//   body 已被消费，保持原单次行为；
+// - 参数 url: 上游完整地址；options: 传给 fetch 的配置；maxRetries: 最大尝试次数。
+// - 返回值: 上游 Response；全部尝试失败时抛出最后一次异常。
+async function fetchWithRetry(url, options, maxRetries) {
+  const method = (options.method || 'GET').toUpperCase();
+  const canRetry = method === 'GET' || method === 'HEAD';
+  const attempts = canRetry ? Math.max(1, maxRetries) : 1;
+  let lastError;
+  for (let i = 0; i < attempts; i++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      // 上游 5xx/429 视为本次失败，若还有机会则换一次尝试
+      if (canRetry && (response.status >= 500 || response.status === 429) && i < attempts - 1) {
+        lastError = new Error('upstream status ' + response.status);
+        continue;
+      }
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (i >= attempts - 1) throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastError;
+}
+
 async function handleRequest(request) {
   const url = new URL(request.url);
   let path = url.pathname;
@@ -845,12 +885,31 @@ async function handleRequest(request) {
     // 非 Git 请求使用 manual 重定向以便拦截 307 并自己请求 S3
     const redirectMode = isGit ? 'follow' : 'manual';
 
-    let response = await fetch(targetUrl, {
+    // 边缘缓存：仅对 GET 生效，命中直接返回，绕开跨境回源抖动；
+    // caches 在部分运行时可能不可用，包 try 保证不影响主流程
+    const edgeCache = (typeof caches !== 'undefined' && caches.default) ? caches.default : null;
+    if (edgeCache && request.method === 'GET') {
+      try {
+        const cached = await edgeCache.match(request.url);
+        if (cached) {
+          const hit = new Response(cached.body, cached);
+          hit.headers.set('Access-Control-Allow-Origin', '*');
+          return hit;
+        }
+      } catch (cacheError) { /* 缓存不可用时走正常回源 */ }
+    }
+
+    let response = await fetchWithRetry(targetUrl, {
       method: request.method,
       headers: newRequestHeaders,
       body: request.body,
       redirect: redirectMode
-    });
+    }, 3);
+
+    // 回写边缘缓存：仅缓存 200 的 GET 响应，TTL 跟随上游 Cache-Control（GitHub raw 为 5 分钟）
+    if (edgeCache && request.method === 'GET' && response.status === 200) {
+      try { await edgeCache.put(request.url, response.clone()); } catch (cacheError) { /* 写缓存失败不影响响应 */ }
+    }
 
     // 处理 Docker 认证挑战（401 时自动获取匿名 token 重试）
     if (isDockerRequest && response.status === 401) {
@@ -912,7 +971,9 @@ async function handleRequest(request) {
 
     return newResponse;
   } catch (error) {
-    return new Response('Error fetching from ' + targetDomain + ': ' + error.message + '\n', { status: 500 });
+    // 回源超时（AbortError）报 504 与边缘函数被平台掐断的现象区分开，其余错误报 500
+    const isTimeout = error && error.name === 'AbortError';
+    return new Response('Error fetching from ' + targetDomain + ': ' + error.message + '\n', { status: isTimeout ? 504 : 500 });
   }
 }
 
