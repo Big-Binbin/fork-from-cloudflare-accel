@@ -1,10 +1,14 @@
 // 注意: 本文件是 EdgeOne Pages 的部署入口(edge-functions catch-all), 与根目录 _worker.js 逻辑一致
-// 更新日期: 2026-09-05
+// 更新日期: 2026-09-05 (v3)
 // 更新内容:
-// 1. 回源请求增加超时与重试（fetchWithRetry）：单次回源最多等 10s，GET/HEAD 失败自动重试，
-//    解决 EdgeOne 大陆节点回源 GitHub 偶发跨境抖动导致的间歇性 504
-// 2. 新增边缘缓存：GET 的 200 响应写入 caches.default，TTL 跟随上游 Cache-Control，
-//    热点文件命中缓存直接返回，不再回源
+// 1. 修正重试参数：单次超时 10s×3 次会超出边缘函数 15s 执行时限，导致重试跑不完
+//    就被平台掐断（客户端连接被吊死）；改为首试 6.5s + 重试 5s 共 2 次，压在时限内
+// 2. raw 线路兜底：raw.githubusercontent.com 回源彻底失败时，GET 请求自动改走
+//    jsDelivr CDN（国内可达性好，内容有缓存延迟，仅作兜底）
+// 3. 边缘缓存 TTL 统一压成 5 分钟，避免跟随 jsDelivr 的 1 年 immutable 头
+// 历史更新（2026-09-05 v2）:
+// 1. 回源请求增加超时与重试（fetchWithRetry），解决大陆节点回源 GitHub 偶发跨境抖动
+// 2. 新增边缘缓存：GET 的 200 响应写入 caches.default
 // 3. 回源超时显式返回 504（AbortError），与普通错误 500 区分，便于排查
 // 历史更新（2026-08-22）:
 // 1. Docker 镜像层重定向改为循环跟随（最多 5 次），支持 CDN 多级跳转，提升拉取成功率
@@ -688,10 +692,19 @@ function buildGitHeaders(request, targetDomain) {
   return headers;
 }
 
+// raw.githubusercontent.com 转 jsDelivr CDN 地址（兜底线路，国内可达性好）
+// 支持两种路径格式：/user/repo/branch/path 与 /user/repo/refs/heads|tags/tag/path
+// 返回值: jsDelivr 地址字符串；非 raw 地址返回 null
+function rawToJsDelivr(url) {
+  const m = url.match(/^https:\/\/raw\.githubusercontent\.com\/([^\/]+)\/([^\/]+)\/(?:refs\/(?:heads|tags)\/)?([^\/]+)\/(.+)$/);
+  if (!m) return null;
+  return 'https://cdn.jsdelivr.net/gh/' + m[1] + '/' + m[2] + '@' + m[3] + '/' + m[4];
+}
+
 // 带超时与重试的回源请求
-// 背景：EdgeOne 大陆节点回源 GitHub 偶发跨境抖动，单次裸 fetch 变慢会被边缘函数
-// 约 15s 的执行时限掐断，用户侧表现为间歇性 504。
-// - 每次尝试最多等 10s，超时即放弃本次尝试，为重试留出时间；
+// 背景：EdgeOne 大陆节点回源 GitHub 偶发跨境抖动，且回源慢会被边缘函数
+// 约 15s 的执行时限直接掐断，客户端表现为连接被吊死或间歇性 504。
+// - 超时分两档：首次尝试 6.5s、重试 5s，两次合计约 11.5s，必须留在 15s 平台时限内；
 // - 仅对 GET/HEAD（无请求体、幂等）自动重试；POST 等带流式请求体的方法重试会导致
 //   body 已被消费，保持原单次行为；
 // - 参数 url: 上游完整地址；options: 传给 fetch 的配置；maxRetries: 最大尝试次数。
@@ -702,8 +715,9 @@ async function fetchWithRetry(url, options, maxRetries) {
   const attempts = canRetry ? Math.max(1, maxRetries) : 1;
   let lastError;
   for (let i = 0; i < attempts; i++) {
+    const timeoutMs = i === 0 ? 6500 : 5000;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10000);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetch(url, { ...options, signal: controller.signal });
       // 上游 5xx/429 视为本次失败，若还有机会则换一次尝试
@@ -900,16 +914,33 @@ async function handleRequest(request) {
       } catch (cacheError) { /* 缓存不可用时走正常回源 */ }
     }
 
-    let response = await fetchWithRetry(targetUrl, {
-      method: request.method,
-      headers: newRequestHeaders,
-      body: request.body,
-      redirect: redirectMode
-    }, 3);
+    let response;
+    try {
+      response = await fetchWithRetry(targetUrl, {
+        method: request.method,
+        headers: newRequestHeaders,
+        body: request.body,
+        redirect: redirectMode
+      }, 2);
+    } catch (upstreamError) {
+      // raw 线路兜底：彻底失败时改走 jsDelivr（仅 GET；jsDelivr 内容有缓存延迟，仅作兜底）
+      const fallbackUrl = request.method === 'GET' ? rawToJsDelivr(targetUrl) : null;
+      if (!fallbackUrl) throw upstreamError;
+      response = await fetchWithRetry(fallbackUrl, {
+        method: 'GET',
+        headers: newRequestHeaders,
+        redirect: 'follow'
+      }, 2);
+    }
 
-    // 回写边缘缓存：仅缓存 200 的 GET 响应，TTL 跟随上游 Cache-Control（GitHub raw 为 5 分钟）
+    // 回写边缘缓存：仅缓存 200 的 GET 响应；TTL 统一压成 5 分钟（上游若是 jsDelivr
+    // 会带 max-age=31536000 的 immutable 头，直接跟随会把过期内容钉死在缓存里）
     if (edgeCache && request.method === 'GET' && response.status === 200) {
-      try { await edgeCache.put(request.url, response.clone()); } catch (cacheError) { /* 写缓存失败不影响响应 */ }
+      try {
+        const cacheCopy = response.clone();
+        cacheCopy.headers.set('Cache-Control', 'max-age=300');
+        await edgeCache.put(request.url, cacheCopy);
+      } catch (cacheError) { /* 写缓存失败不影响响应 */ }
     }
 
     // 处理 Docker 认证挑战（401 时自动获取匿名 token 重试）
