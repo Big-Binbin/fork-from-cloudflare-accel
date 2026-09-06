@@ -713,13 +713,18 @@ async function fetchWithRetry(url, options, maxRetries) {
   const method = (options.method || 'GET').toUpperCase();
   const canRetry = method === 'GET' || method === 'HEAD';
   const attempts = canRetry ? Math.max(1, maxRetries) : 1;
+  // 超时档位可由调用方覆盖：raw 主线路 5s/4s，jsDelivr 兜底单次 4s，
+  // 全链路最坏 5+4+4=13s，必须留在边缘函数约 15s 的执行时限内
+  const firstTimeoutMs = options.timeoutMs || 5000;
+  const retryTimeoutMs = options.retryTimeoutMs || 4000;
   let lastError;
   for (let i = 0; i < attempts; i++) {
-    const timeoutMs = i === 0 ? 6500 : 5000;
+    const timeoutMs = i === 0 ? firstTimeoutMs : retryTimeoutMs;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetch(url, { ...options, signal: controller.signal });
+      const { timeoutMs: _t1, retryTimeoutMs: _t2, ...fetchOptions } = options;
+      const response = await fetch(url, { ...fetchOptions, signal: controller.signal });
       // 上游 5xx/429 视为本次失败，若还有机会则换一次尝试
       if (canRetry && (response.status >= 500 || response.status === 429) && i < attempts - 1) {
         lastError = new Error('upstream status ' + response.status);
@@ -929,8 +934,9 @@ async function handleRequest(request) {
       response = await fetchWithRetry(fallbackUrl, {
         method: 'GET',
         headers: newRequestHeaders,
-        redirect: 'follow'
-      }, 2);
+        redirect: 'follow',
+        timeoutMs: 4000
+      }, 1);
     }
 
     // 回写边缘缓存：仅缓存 200 的 GET 响应；TTL 统一压成 5 分钟（上游若是 jsDelivr
