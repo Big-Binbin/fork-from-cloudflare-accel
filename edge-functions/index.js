@@ -121,7 +121,7 @@ const HOMEPAGE_HTML = `
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Cloudflare 加速</title>
+  <title>EdgeOne 加速</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,${encodeURIComponent(LIGHTNING_SVG)}">
   <style>
     * { box-sizing: border-box; }
@@ -367,7 +367,7 @@ const HOMEPAGE_HTML = `
     <span class="moon hidden">🌙</span>
   </button>
   <div class="container">
-    <h1>Cloudflare 加速下载</h1>
+    <h1>EdgeOne 加速下载</h1>
 
     <!-- GitHub 链接转换 -->
     <div class="section-box">
