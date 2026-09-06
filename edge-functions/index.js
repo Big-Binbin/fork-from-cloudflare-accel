@@ -1,11 +1,13 @@
 // 注意: 本文件是 EdgeOne Pages 的部署入口(edge-functions catch-all), 与根目录 _worker.js 逻辑一致
-// 更新日期: 2026-09-05 (v3)
+// 更新日期: 2026-09-05 (v4)
 // 更新内容:
-// 1. 修正重试参数：单次超时 10s×3 次会超出边缘函数 15s 执行时限，导致重试跑不完
-//    就被平台掐断（客户端连接被吊死）；改为首试 6.5s + 重试 5s 共 2 次，压在时限内
-// 2. raw 线路兜底：raw.githubusercontent.com 回源彻底失败时，GET 请求自动改走
-//    jsDelivr CDN（国内可达性好，内容有缓存延迟，仅作兜底）
-// 3. 边缘缓存 TTL 统一压成 5 分钟，避免跟随 jsDelivr 的 1 年 immutable 头
+// 1. 失败语义重构：超时=线路级不通，立即换线不再原地重试（实测部分节点到 raw
+//    的线路整条不可达，重试同线路只会白白烧掉时限）；5xx/429 才同线路重试
+// 2. 全链路最坏耗时从 21.5s 压到 9s（raw 5s 超时换线 + jsDelivr 4s），
+//    彻底退出边缘函数 15s 执行时限的危险区
+// 3. raw 失败兜底走 jsDelivr CDN；边缘缓存 TTL 统一 5 分钟
+// 历史更新（2026-09-05 v3）: 重试参数压进时限内/新增 jsDelivr 兜底/缓存 TTL 压缩
+// 历史更新（2026-09-05 v2）: 回源超时重试+边缘缓存，解决大陆节点间歇性 504
 // 历史更新（2026-09-05 v2）:
 // 1. 回源请求增加超时与重试（fetchWithRetry），解决大陆节点回源 GitHub 偶发跨境抖动
 // 2. 新增边缘缓存：GET 的 200 响应写入 caches.default
@@ -704,10 +706,12 @@ function rawToJsDelivr(url) {
 // 带超时与重试的回源请求
 // 背景：EdgeOne 大陆节点回源 GitHub 偶发跨境抖动，且回源慢会被边缘函数
 // 约 15s 的执行时限直接掐断，客户端表现为连接被吊死或间歇性 504。
-// - 超时分两档：首次尝试 6.5s、重试 5s，两次合计约 11.5s，必须留在 15s 平台时限内；
+// - 失败语义分两类：超时中止（AbortError）= 线路级不通，立即抛出由调用方换线；
+//   5xx/429 = 线路可达临时出错，同线路重试一次；
 // - 仅对 GET/HEAD（无请求体、幂等）自动重试；POST 等带流式请求体的方法重试会导致
 //   body 已被消费，保持原单次行为；
-// - 参数 url: 上游完整地址；options: 传给 fetch 的配置；maxRetries: 最大尝试次数。
+// - 参数 url: 上游完整地址；options: 传给 fetch 的配置（可含 timeoutMs/retryTimeoutMs
+//   覆盖默认 5s/4s 档位）；maxRetries: 同线路最大尝试次数。
 // - 返回值: 上游 Response；全部尝试失败时抛出最后一次异常。
 async function fetchWithRetry(url, options, maxRetries) {
   const method = (options.method || 'GET').toUpperCase();
@@ -725,13 +729,15 @@ async function fetchWithRetry(url, options, maxRetries) {
     try {
       const { timeoutMs: _t1, retryTimeoutMs: _t2, ...fetchOptions } = options;
       const response = await fetch(url, { ...fetchOptions, signal: controller.signal });
-      // 上游 5xx/429 视为本次失败，若还有机会则换一次尝试
+      // 上游 5xx/429 说明线路可达只是临时出错，同线路重试有意义
       if (canRetry && (response.status >= 500 || response.status === 429) && i < attempts - 1) {
         lastError = new Error('upstream status ' + response.status);
         continue;
       }
       return response;
     } catch (error) {
+      // 超时中止=线路级不通，同线路重试无意义，直接抛出让调用方换备用线路
+      if (error.name === 'AbortError') throw error;
       lastError = error;
       if (i >= attempts - 1) throw error;
     } finally {
@@ -921,6 +927,7 @@ async function handleRequest(request) {
 
     let response;
     try {
+      // raw 主线路：超时 5s 立即抛出，由下方兜底换线；最坏 5s+4s 兜底=9s 内必有结果
       response = await fetchWithRetry(targetUrl, {
         method: request.method,
         headers: newRequestHeaders,
