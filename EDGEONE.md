@@ -175,6 +175,37 @@ node -e "fetch(process.argv[1]).then(async r=>console.log(r.status, (await r.arr
 - 免费版每天 40 次部署机会
 - `edgeone` CLI **不支持**站点级配置（Gzip/Brotli、缓存规则、HTTPS 等）；那些属于 EdgeOne 站点（zone）管理，需要腾讯云 API 密钥或控制台操作
 
-## 九、许可证
+## 九、附：本机无法直连 github.com 时，用加速通道推送代码
+
+部分网络环境下 `github.com:443` 的 git 协议不通（实测直连 **21s 超时失败**），但**本加速服务本身就能代理 git 协议**，可直接拿它来推送：
+
+```bash
+# 只读验证
+git ls-remote https://你的域名/https://github.com/<user>/<repo>.git
+
+# 推送（token 用 Personal Access Token，需 repo 权限）
+git push https://<用户名>:<token>@你的域名/https://github.com/<user>/<repo>.git HEAD:main
+```
+
+实测对比：
+
+| 通道 | ls-remote | push（8.8 KB packfile） |
+|---|---|---|
+| 直连 github.com | ❌ 21s 超时 | ❌ 连接重置 |
+| 经本加速服务 | ✅ 2.3s | ✅ 5.2s |
+
+也可以把 remote 直接指向加速通道，之后 `git push` / `git fetch` 都走它：
+
+```bash
+git remote set-url origin https://你的域名/https://github.com/<user>/<repo>.git
+```
+
+> ⚠️ **限制**：Edge Functions 的**请求 body 上限为 1 MB**，所以这条路只适合小体量推送。
+> 大仓库（packfile 超 1 MB）会失败，需换其他网络通道。
+>
+> 💡 原理：git 客户端 UA 含 `git/`，会被本服务识别为 Git 请求走专门分支，且该分支**保留
+> `Authorization` 头**（仅删除 Cookie / CF-* / x-amz-* 等干扰头），因此 Basic 认证可以正常透传。
+
+## 十、许可证
 
 与原项目一致，见 [LICENSE](LICENSE)。
