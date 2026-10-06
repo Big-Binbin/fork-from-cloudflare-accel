@@ -731,6 +731,8 @@ async function fetchWithRetry(url, options, maxRetries) {
       // 上游 5xx/429 说明线路可达只是临时出错，同线路重试有意义
       if (canRetry && (response.status >= 500 || response.status === 429) && i < attempts - 1) {
         lastError = new Error('upstream status ' + response.status);
+        // 重试前主动释放上一个响应体，避免连接/内存泄漏
+        try { if (response.body) await response.body.cancel(); } catch (e) { /* 忽略 */ }
         continue;
       }
       return response;
@@ -977,32 +979,68 @@ async function handleRequest(request) {
       }
     }
 
-    // 处理 Docker 重定向（镜像层可能多级 CDN 跳转，循环由 Worker 继续反代）
+    // 跟随上游重定向，避免客户端拿到裸 302 而绕过加速。
+    // 典型场景：GitHub Release 下载 302 到 release-assets.githubusercontent.com
+    // （原实现只对 Docker 请求跟随，导致所有 Release 下载都变成裸跳转、走不到加速）；
+    // Docker 镜像层也会 302/307 多级跳到 CDN 或 S3。
+    // 仅对无请求体的 GET/HEAD 跟随；只跟白名单内域名，防止被上游 302 带出白名单。
     let redirects = 0;
-    while (isDockerRequest && (response.status === 302 || response.status === 307)) {
-      const redirectUrl = response.headers.get('Location');
-      if (!redirectUrl || redirects >= MAX_REDIRECTS) {
-        break;
-      }
+    let currentUrl = targetUrl;
+    const canFollowRedirect = request.method === 'GET' || request.method === 'HEAD';
+    while (canFollowRedirect && redirects < MAX_REDIRECTS &&
+           (response.status === 301 || response.status === 302 || response.status === 303 ||
+            response.status === 307 || response.status === 308)) {
+      const rawLocation = response.headers.get('Location');
+      if (!rawLocation) break;
+
+      // Location 可能是相对路径，需以当前 URL 为基准解析
+      let nextUrl;
+      try { nextUrl = new URL(rawLocation, currentUrl).toString(); } catch { break; }
+
+      // 白名单校验：不允许被上游重定向带到白名单之外的域名
+      let nextHost;
+      try { nextHost = new URL(nextUrl).hostname; } catch { break; }
+      if (!ALLOWED_HOSTS.includes(nextHost)) break;
+
       redirects++;
+      currentUrl = nextUrl;
       const redirectHeaders = new Headers(newRequestHeaders);
-      redirectHeaders.set('Host', new URL(redirectUrl).hostname);
+      redirectHeaders.set('Host', nextHost);
 
       // 对于 S3 重定向，添加必要的 AWS 头
-      if (isAmazonS3(redirectUrl)) {
+      if (isAmazonS3(nextUrl)) {
         redirectHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
         redirectHeaders.set('x-amz-date', getAmzDate());
       }
 
-      response = await fetch(redirectUrl, {
-        method: request.method,
-        headers: redirectHeaders,
-        body: request.body,
-        redirect: 'manual'
-      });
+      // 单跳超时保护：重定向目标（如 release-assets.githubusercontent.com）从部分
+      // 边缘节点回源会长时间无响应，裸 fetch 会把函数一直挂到平台掐断（实测 >40s）。
+      // 注意：fetch 在响应头到达时即 resolve，定时器随之清除，因此这里只约束
+      // "连接+首字节"，不会掐断后续的大文件流式传输。
+      const hopController = new AbortController();
+      const hopTimer = setTimeout(() => hopController.abort(), 8000);
+      try {
+        response = await fetch(nextUrl, {
+          method: request.method,
+          headers: redirectHeaders,
+          body: request.body,
+          redirect: 'manual',
+          signal: hopController.signal
+        });
+      } finally {
+        clearTimeout(hopTimer);
+      }
     }
 
     // 复制响应并添加 CORS 头
+    //
+    // ⚠️ 平台差异（两个平台的入口文件请勿互相照搬编码处理逻辑）：
+    //   · Cloudflare：fetch 不会自动解压上游响应体，Content-Encoding 与 body 始终一致，
+    //     因此本文件无需处理编码头，转发浏览器 Accept-Encoding 是安全的。
+    //   · EdgeOne：平台会自动解压 body 却保留 Content-Encoding 头，浏览器据此二次解压
+    //     明文而白屏，必须改为「请求侧 identity + 响应侧删除 Content-Encoding /
+    //     Transfer-Encoding / Content-Length」。详见 edge-functions/[[default]].js
+    //     与 EDGEONE.md 的「已修复的线上问题」。
     const newResponse = new Response(response.body, response);
     newResponse.headers.set('Access-Control-Allow-Origin', '*');
     newResponse.headers.set('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
