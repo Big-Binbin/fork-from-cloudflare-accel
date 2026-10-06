@@ -137,7 +137,53 @@ edgeone makers deploy -n <项目名> -a overseas --json
 
 对照：同一台机器**直连 `github.com` 完全不通**（15s 超时），`raw` 直连仅约 8 KB/s。
 
-## 六、验证命令
+## 六、GitHub 网页镜像（在链接前加加速域名即可浏览）
+
+除了下载文件，本服务还能**直接浏览 GitHub 页面** —— 在任意 GitHub 链接前加上加速域名即可：
+
+```
+https://你的域名/https://github.com/<user>/<repo>
+https://你的域名/https://github.com/<user>/<repo>/issues
+https://你的域名/https://github.com/<user>/<repo>/releases
+https://你的域名/https://github.com/<user>/<repo>/blob/main/README.md
+```
+
+### 实现原理
+
+仅对 `github.com` 返回的 `text/html` 生效，**不影响文件下载 / git clone / Docker**。三步：
+
+1. **改写页面内的地址**
+   - `https://github.githubassets.com/...` 与 `//github.githubassets.com/...`（CSS/JS，实测 **164 处**）
+   - `https://avatars.githubusercontent.com/...` 等图片域名
+   - 全部改写为 `加速域名/https://原地址`
+   - 站内相对链接 `href="/..."`（实测 **51 处**）改写为 `加速域名/https://github.com/...`，保证点击后仍在加速通道内
+2. **移除 CSP**：GitHub 的 `Content-Security-Policy` 只允许从 `github.githubassets.com` 加载脚本/样式，
+   地址改写后会全部被浏览器按 CSP 拒绝执行，因此必须移除该响应头
+3. **扩充白名单**：新增 `github.githubassets.com`、`opengraph.githubassets.com`、
+   `identicons.github.com`、`collector.github.com`
+
+> 改写顺序很关键：**先处理绝对/协议相对地址，再处理以 `/` 开头的相对链接**。
+> 反过来的话，第一步生成的 `origin/https://host` 会被第二步二次改写为 `origin/https://origin/https://host`。
+
+### 实测
+
+| 页面 | 结果 |
+|---|---|
+| 仓库主页 | 200 · 319 KB |
+| Issues | 200 · 280 KB |
+| Releases | 200 · 192 KB |
+| 文件页面（blob） | 200 · 319 KB |
+| 地址改写 | 327 处，**0 处残留相对链接** |
+| CSP | 已移除 |
+| 静态资源（githubassets / avatars） | 200 |
+
+### ⚠️ 局限
+
+GitHub 前端是 React 单页应用，**由 JS 动态发起的请求不会被改写**（例如站内搜索、代码搜索），
+登录态也不会透传。因此这个镜像**适合浏览公开仓库的静态内容**（代码、Issues、Releases、README 图片），
+不适合当作完整的 GitHub 前端使用。
+
+## 七、验证命令
 
 ```bash
 D=https://你的域名
@@ -161,13 +207,13 @@ node -e "fetch(process.argv[1]).then(async r=>console.log(r.status, (await r.arr
 > ⚠️ **Windows 自带 curl 不支持 brotli**：遇到 `Content-Encoding: br` 会解压失败、显示 0 字节。
 > 这是 curl 自身的限制，**不代表服务有问题**——请用浏览器或 Node 原生 `fetch` 验证。
 
-## 七、已知限制
+## 八、已知限制
 
 - 免费版请求体上限 1 MB，`git push` / Docker push 不可用
 - 数百 MB 级大文件长时间流式传输是否会被平台掐断，需按需实测
 - `_worker.js`（Cloudflare 版）**未同步本次修复**：编码处理是 EdgeOne 专属的——Cloudflare 不会自动解压上游 body，照搬会导致客户端拿到压缩数据当明文。两个平台需分别维护
 
-## 八、社区踩坑记录（供参考）
+## 九、社区踩坑记录（供参考）
 
 - EdgeOne Pages Functions **不支持 `addEventListener('fetch')`**，必须使用 Function Handlers（`onRequest`）；且函数代码一旦报错，平台**不会**将其识别为有效路由，后台连函数都看不到
 - `edgeone.json` 的 `rewrites` **不能重写到外部绝对 URL**
@@ -175,7 +221,7 @@ node -e "fetch(process.argv[1]).then(async r=>console.log(r.status, (await r.arr
 - 免费版每天 40 次部署机会
 - `edgeone` CLI **不支持**站点级配置（Gzip/Brotli、缓存规则、HTTPS 等）；那些属于 EdgeOne 站点（zone）管理，需要腾讯云 API 密钥或控制台操作
 
-## 九、附：本机无法直连 github.com 时，用加速通道推送代码
+## 十、附：本机无法直连 github.com 时，用加速通道推送代码
 
 部分网络环境下 `github.com:443` 的 git 协议不通（实测直连 **21s 超时失败**），但**本加速服务本身就能代理 git 协议**，可直接拿它来推送：
 
@@ -206,6 +252,6 @@ git remote set-url origin https://你的域名/https://github.com/<user>/<repo>.
 > 💡 原理：git 客户端 UA 含 `git/`，会被本服务识别为 Git 请求走专门分支，且该分支**保留
 > `Authorization` 头**（仅删除 Cookie / CF-* / x-amz-* 等干扰头），因此 Basic 认证可以正常透传。
 
-## 十、许可证
+## 十一、许可证
 
 与原项目一致，见 [LICENSE](LICENSE)。

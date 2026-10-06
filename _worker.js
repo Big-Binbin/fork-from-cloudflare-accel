@@ -49,6 +49,10 @@ const ALLOWED_HOSTS = [
   'media.githubusercontent.com',
   'avatars.githubusercontent.com',
   'camo.githubusercontent.com',
+  'github.githubassets.com',
+  'opengraph.githubassets.com',
+  'identicons.github.com',
+  'collector.github.com',
   'private-user-images.githubusercontent.com',
   'user-images.githubusercontent.com',
   'cloud.githubusercontent.com',
@@ -693,6 +697,42 @@ function buildGitHeaders(request, targetDomain) {
   return headers;
 }
 
+// GitHub 网页镜像：把页面里的资源/链接改写成经本加速服务的地址
+// 这样「在 GitHub 链接前加加速域名」就能直接浏览仓库页面，而不只是下载文件。
+// 仅对 github.com 返回的 text/html 生效，不影响文件下载 / git clone / Docker。
+const MIRROR_HOSTS = [
+  'github.githubassets.com',
+  'opengraph.githubassets.com',
+  'identicons.github.com',
+  'avatars.githubusercontent.com',
+  'camo.githubusercontent.com',
+  'media.githubusercontent.com',
+  'user-images.githubusercontent.com',
+  'private-user-images.githubusercontent.com',
+  'collector.github.com',
+  'api.github.com',
+  'github.com'
+];
+
+// 重写 GitHub 页面 HTML
+// 参数：html 原始页面文本；origin 本加速服务的源
+// 返回值：改写后的 HTML
+// 说明：必须先处理绝对/协议相对地址，再处理以 / 开头的站内相对链接，
+//       否则第一步生成的 "origin/https://host" 会被第二步二次改写。
+function rewriteGithubHtml(html, origin) {
+  // 1) 绝对与协议相对地址（https://host 与 //host）统一改写成 origin/https://host
+  for (const host of MIRROR_HOSTS) {
+    const re = new RegExp('(?:https?:)?//' + host.replace(/\./g, '\\.'), 'g');
+    html = html.replace(re, origin + '/https://' + host);
+  }
+  // 2) 站内相对链接（href="/xxx"、src="/xxx"、action="/xxx"）→ 指回 github.com
+  html = html.replace(
+    /((?:href|src|action|poster|data-[\w-]+)\s*=\s*["'])\/(?!\/)/gi,
+    (m, prefix) => prefix + origin + '/https://github.com/'
+  );
+  return html;
+}
+
 // raw.githubusercontent.com 转 jsDelivr CDN 地址（兜底线路，国内可达性好）
 // 支持两种路径格式：/user/repo/branch/path 与 /user/repo/refs/heads|tags/tag/path
 // 返回值: jsDelivr 地址字符串；非 raw 地址返回 null
@@ -1030,6 +1070,28 @@ async function handleRequest(request) {
       } finally {
         clearTimeout(hopTimer);
       }
+    }
+
+    // GitHub 网页镜像：仅当目标是 github.com 且返回 HTML 时改写页面内的资源与链接。
+    // 必须同时移除 CSP：原 CSP 只允许从 github.githubassets.com 加载脚本/样式，
+    // 改写后地址变成加速域名，会被浏览器按 CSP 拒绝执行。
+    const mirrorType = response.headers.get('Content-Type') || '';
+    if (!isDockerRequest && targetDomain === 'github.com' &&
+        mirrorType.includes('text/html') && request.method === 'GET') {
+      const page = rewriteGithubHtml(await response.text(), url.origin);
+      const mirrorHeaders = new Headers(response.headers);
+      mirrorHeaders.delete('Content-Security-Policy');
+      mirrorHeaders.delete('Content-Security-Policy-Report-Only');
+      mirrorHeaders.delete('Content-Encoding');
+      mirrorHeaders.delete('Transfer-Encoding');
+      mirrorHeaders.delete('Content-Length');
+      mirrorHeaders.set('Content-Type', 'text/html; charset=utf-8');
+      mirrorHeaders.set('Access-Control-Allow-Origin', '*');
+      return new Response(page, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: mirrorHeaders
+      });
     }
 
     // 复制响应并添加 CORS 头
