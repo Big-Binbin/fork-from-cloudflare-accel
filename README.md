@@ -4,9 +4,14 @@
 
 一个基于 Cloudflare Workers 或 Cloudflare Pages 的反向代理服务，旨在加速 GitHub/GitLab 仓库克隆、GitHub 文件下载和 Docker 镜像拉取。通过 Cloudflare 的全球边缘网络，提供更快、更稳定的下载体验。项目提供直观的网页界面，支持将 GitHub 文件链接、Git 仓库地址和 Docker 镜像地址转换为加速链接或命令，并自动复制到剪贴板。界面针对 PC 和移动端（iPhone、Android）进行了优化，复制功能兼容主流浏览器。
 
+> **📌 本仓库是 EdgeOne 移植版**
+> 在原版（Cloudflare Workers / Pages）基础上，新增了**腾讯云 EdgeOne Makers** 的部署入口 `edge-functions/`，并修复了在 EdgeOne 上实测出的两个线上问题（浏览器空白页、GitHub Release 裸 302）。
+> **EdgeOne 部署步骤、平台限额、加速区域选择与踩坑记录 → 见 [EDGEONE.md](EDGEONE.md)**
+
 ## 目录
 
 - [特点](#特点)
+- [**腾讯云 EdgeOne 部署与实测记录（EDGEONE.md）**](EDGEONE.md)
 - [部署方法](#部署方法)
   - [效果演示](#效果演示)
   - [使用 Cloudflare Workers 部署](#使用-cloudflare-workers-部署)
