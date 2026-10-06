@@ -863,6 +863,15 @@ async function handleRequest(request) {
     if (targetDomain === 'docker.io' || targetDomain === 'index.docker.io') {
       targetDomain = 'registry-1.docker.io';
     }
+  } else if (!fullPath.startsWith('http://') && !fullPath.startsWith('https://') &&
+             (request.headers.get('Referer') || '').startsWith(url.origin + '/https://github.com/')) {
+    // GitHub 网页镜像：浏览器从「本代理下的 github.com 页面」发起的相对路径请求，
+    // 其路径本身就是 github.com 上的路径（如 /user/repo/tree-commit-info/main、/_graphql、
+    // /search/count）。这些是页面里 React 应用动态发起的，无法在 HTML 里改写，
+    // 若按 Docker 镜像名去解析会 404，导致文件树/最新提交等区域显示不出来。
+    // 用 Referer 判定即可区分：Docker 客户端不带 Referer，因此不受影响。
+    targetDomain = 'github.com';
+    targetPath = path.replace(/^\//, '') + url.search;
   } else {
     // 处理 Docker 镜像路径的多种格式
     if (pathParts[0] === 'docker.io') {
@@ -944,6 +953,14 @@ async function handleRequest(request) {
     // （做法与 EdgeOne 生产项目 MedicalChannelAI PR #62 一致）
     newRequestHeaders.delete('Accept-Encoding');
     newRequestHeaders.set('Accept-Encoding', 'identity');
+
+    // 镜像页的相对请求：把 Referer 还原成对应的 github.com 页面地址，
+    // 并移除 Origin（浏览器发同源请求本不带 Origin，若带则 GitHub 可能拒绝）。
+    const mirrorSource = request.headers.get('Referer') || '';
+    if (mirrorSource.startsWith(url.origin + '/https://github.com')) {
+      newRequestHeaders.set('Referer', 'https://github.com' + mirrorSource.slice((url.origin + '/https://github.com').length));
+      newRequestHeaders.delete('Origin');
+    }
     newRequestHeaders.delete('x-amz-content-sha256');
     newRequestHeaders.delete('x-amz-date');
     newRequestHeaders.delete('x-amz-security-token');

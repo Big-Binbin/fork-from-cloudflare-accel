@@ -165,6 +165,26 @@ https://你的域名/https://github.com/<user>/<repo>/blob/main/README.md
 > 改写顺序很关键：**先处理绝对/协议相对地址，再处理以 `/` 开头的相对链接**。
 > 反过来的话，第一步生成的 `origin/https://host` 会被第二步二次改写为 `origin/https://origin/https://host`。
 
+### 关键补充：页面 JS 发起的相对请求（否则部分内容加载不出来）
+
+GitHub 前端是 React 应用，页面加载完成后仍会发起**相对路径**的 XHR，例如：
+
+```
+/user/repo/tree-commit-info/main     文件树的每个文件状态
+/user/repo/latest-commit/main        最新提交信息
+/_graphql                            GraphQL 查询
+/search/count                        搜索计数
+```
+
+这些请求由 JS 动态发起，**无法在 HTML 里改写**；它们落到加速域名上会被当成 **Docker 镜像名**解析 → **404**，
+表现为文件树、最新提交等区域空白或加载不出来。
+
+**修复**：用 `Referer` 判定 —— 若请求不带 `http(s)://` 前缀、且 `Referer` 以
+`<加速域名>/https://github.com/` 开头，就把整个路径原样转发到 github.com；
+同时把 `Referer` 还原成对应的 github.com 地址并移除 `Origin`，避免 GitHub 的 Referer/CSRF 校验拒绝。
+
+> Docker 客户端**不带 Referer**，因此镜像名路径不受影响（已回归验证 `/v2/...` 正常）。
+
 ### 实测
 
 | 页面 | 结果 |
